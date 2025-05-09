@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"image"
 	"image/color"
-	"image/gif"
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -375,7 +374,11 @@ func (sim *FluidFlowSimulation) SaveResults() {
 func (sim *FluidFlowSimulation) savePlot(filename string, field [][]float64, title string) {
 
 	// Save data to a text file instead (simple alternative to heatmap)
-	f, err := os.Create(filename + ".data")
+
+	dataDir := "data"
+	filepath := filepath.Join(dataDir, filename+".data")
+
+	f, err := os.Create(filepath)
 	if err != nil {
 		panic(err)
 	}
@@ -394,8 +397,10 @@ func (sim *FluidFlowSimulation) savePlot(filename string, field [][]float64, tit
 
 // saveVelocityPlot saves vectors to a data file
 func (sim *FluidFlowSimulation) saveVelocityPlot(filename string) {
-	// Save velocity data to file
-	f, err := os.Create(filename + ".data")
+	dataDir := "data"
+	filepath := filepath.Join(dataDir, filename+".data")
+
+	f, err := os.Create(filepath)
 	if err != nil {
 		panic(err)
 	}
@@ -414,110 +419,6 @@ func (sim *FluidFlowSimulation) saveVelocityPlot(filename string) {
 	}
 
 	fmt.Printf("Velocity data saved to %s.data\n", filename)
-}
-
-// AnimateFlow creates an animation of particle movement in the flow field
-func (sim *FluidFlowSimulation) AnimateFlow(numFrames int, saveGif bool) {
-	if !saveGif {
-		return // Skip if not saving GIF
-	}
-
-	// Create GIF
-	anim := &gif.GIF{
-		LoopCount: 0, // Loop infinitely
-	}
-
-	width, height := 500, 400
-	bounds := image.Rect(0, 0, width, height)
-
-	// Create particles at inlet
-	numParticles := 50
-	particlesY := linspace(sim.y[0], sim.y[sim.ny-1], numParticles)
-	particlesX := make([]float64, numParticles)
-	for i := range particlesX {
-		particlesX[i] = sim.x[0]
-	}
-
-	for frame := 0; frame < numFrames; frame++ {
-		// Create new frame
-		img := image.NewPaletted(bounds, color.Palette{
-			color.White, color.Black, color.RGBA{255, 0, 0, 255}, // white, black, red
-		})
-
-		// Draw streamlines (simplified)
-		for j := 0; j < sim.ny-1; j++ {
-			for i := 0; i < sim.nx-1; i++ {
-				if sim.mask[j][i] {
-					// Convert to image coordinates
-					x := int(scale(sim.x[i], sim.x[0], sim.x[sim.nx-1], 0, float64(width)))
-					y := int(scale(sim.y[j], sim.y[0], sim.y[sim.ny-1], float64(height), 0))
-					if x >= 0 && x < width && y >= 0 && y < height {
-						img.SetColorIndex(x, y, 1) // black for streamlines
-					}
-				}
-			}
-		}
-
-		// Draw particles
-		for i := 0; i < numParticles; i++ {
-			// Convert to image coordinates
-			x := int(scale(particlesX[i], sim.x[0], sim.x[sim.nx-1], 0, float64(width)))
-			y := int(scale(particlesY[i], sim.y[0], sim.y[sim.ny-1], float64(height), 0))
-			if x >= 0 && x < width && y >= 0 && y < height {
-				img.SetColorIndex(x, y, 2) // Red for particles
-			}
-
-			// Update particle positions
-			ix := findIndex(sim.x, particlesX[i]) - 1
-			iy := findIndex(sim.y, particlesY[i]) - 1
-			ix = max(0, min(ix, sim.nx-2))
-			iy = max(0, min(iy, sim.ny-2))
-
-			// Interpolate velocity
-			xFrac := (particlesX[i] - sim.x[ix]) / sim.dx
-			yFrac := (particlesY[i] - sim.y[iy]) / sim.dy
-
-			uInterp := (1-xFrac)*(1-yFrac)*sim.u[iy][ix] +
-				xFrac*(1-yFrac)*sim.u[iy][ix+1] +
-				(1-xFrac)*yFrac*sim.u[iy+1][ix] +
-				xFrac*yFrac*sim.u[iy+1][ix+1]
-
-			vInterp := (1-xFrac)*(1-yFrac)*sim.v[iy][ix] +
-				xFrac*(1-yFrac)*sim.v[iy][ix+1] +
-				(1-xFrac)*yFrac*sim.v[iy+1][ix] +
-				xFrac*yFrac*sim.v[iy+1][ix+1]
-
-			// Update position
-			particlesX[i] += uInterp * 0.1
-			particlesY[i] += vInterp * 0.1
-
-			// Reset particles that exit
-			if particlesX[i] > sim.x[sim.nx-1] || particlesX[i] < sim.x[0] ||
-				particlesY[i] > sim.y[sim.ny-1] || particlesY[i] < sim.y[0] {
-				particlesX[i] = sim.x[0]
-				particlesY[i] = randomBetween(sim.y[0], sim.y[sim.ny-1])
-			}
-
-			// If particle enters solid, reset
-			if sim.cylinder != nil {
-				cx, cy := sim.cylinder.centerX, sim.cylinder.centerY
-				r := sim.cylinder.radius
-				if math.Pow(particlesX[i]-cx, 2)+math.Pow(particlesY[i]-cy, 2) < math.Pow(r, 2) {
-					particlesX[i] = sim.x[0]
-					particlesY[i] = randomBetween(sim.y[0], sim.y[sim.ny-1])
-				}
-			}
-		}
-
-		// Add frame to animation
-		anim.Delay = append(anim.Delay, 10) // 100ms delay
-		anim.Image = append(anim.Image, img)
-	}
-
-	// Save GIF
-	f, _ := os.Create("flow_animation.gif")
-	defer f.Close()
-	gif.EncodeAll(f, anim)
 }
 
 // Utility functions
@@ -579,7 +480,7 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	// Create simulation
-	sim := NewFluidFlowSimulation(500, 500, 1.0, 30000, 1e-6)
+	sim := NewFluidFlowSimulation(100, 100, 1.0, 30000, 1e-6)
 
 	// Uncomment the desired object
 	//sim.AddCylinder(5.0, 0.0, 1.0)
@@ -588,7 +489,6 @@ func main() {
 	// Solve and visualize
 	sim.SolveStreamFunction()
 	sim.SaveResults()
-	sim.AnimateFlow(100, true)
 
 	fmt.Println("Simulation completed. Results saved to image files and flow_animation.gif")
 }

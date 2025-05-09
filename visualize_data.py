@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import argparse
+import os
 
 
 def load_scalar_data(filename):
@@ -67,7 +68,14 @@ def visualize_scalar_field(filename, title, colormap='coolwarm'):
     plt.ylabel('y')
     plt.axis('equal')
 
-    output_file = filename.replace('.data', '_viz.png')
+    # Create visuals directory if it doesn't exist
+    visuals_dir = "visuals"
+    os.makedirs(visuals_dir, exist_ok=True)
+
+    # Extract base filename without path
+    base_filename = os.path.basename(filename)
+    output_file = os.path.join(visuals_dir, base_filename.replace('.data', '_viz.png'))
+
     plt.savefig(output_file, dpi=150)
     print(f"Visualization saved to {output_file}")
     plt.close()
@@ -92,7 +100,14 @@ def visualize_vector_field(filename, title):
     plt.ylabel('y')
     plt.axis('equal')
 
-    output_file = filename.replace('.data', '_viz.png')
+    # Create visuals directory if it doesn't exist
+    visuals_dir = "visuals"
+    os.makedirs(visuals_dir, exist_ok=True)
+
+    # Extract base filename without path
+    base_filename = os.path.basename(filename)
+    output_file = os.path.join(visuals_dir, base_filename.replace('.data', '_viz.png'))
+
     plt.savefig(output_file, dpi=150)
     print(f"Visualization saved to {output_file}")
     plt.close()
@@ -100,6 +115,8 @@ def visualize_vector_field(filename, title):
 
 def main():
     parser = argparse.ArgumentParser(description='Visualize fluid flow simulation data')
+    parser.add_argument('--data-dir', default='data',
+                        help='Directory containing data files')
     parser.add_argument('--stream', default='stream_function.data',
                         help='Stream function data file')
     parser.add_argument('--velocity', default='velocity_magnitude.data',
@@ -111,10 +128,16 @@ def main():
 
     args = parser.parse_args()
 
-    visualize_scalar_field(args.stream, 'Stream Function')
-    visualize_scalar_field(args.velocity, 'Velocity Magnitude', 'viridis')
-    visualize_scalar_field(args.pressure, 'Pressure Field', 'rainbow')
-    visualize_vector_field(args.vectors, 'Velocity Field')
+    # Create full paths for data files
+    stream_file = os.path.join(args.data_dir, args.stream)
+    velocity_file = os.path.join(args.data_dir, args.velocity)
+    pressure_file = os.path.join(args.data_dir, args.pressure)
+    vectors_file = os.path.join(args.data_dir, args.vectors)
+
+    visualize_scalar_field(stream_file, 'Stream Function')
+    visualize_scalar_field(velocity_file, 'Velocity Magnitude', 'viridis')
+    visualize_scalar_field(pressure_file, 'Pressure Field', 'rainbow')
+    visualize_vector_field(vectors_file, 'Velocity Field')
 
 
 if __name__ == '__main__':
