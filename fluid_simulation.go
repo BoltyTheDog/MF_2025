@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"image/color"
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,15 +31,16 @@ type FluidFlowSimulation struct {
 	tol     float64
 
 	// Domain setup
-	x, y     []float64
-	dx, dy   float64
-	X, Y     [][]float64
-	psi, phi [][]float64
-	mask     [][]bool
-	u, v     [][]float64
-	p        [][]float64
-	cylinder *Circle
-	airfoil  *Airfoil
+	x, y             []float64
+	dx, dy           float64
+	X, Y             [][]float64
+	psi, phi         [][]float64
+	mask             [][]bool
+	u, v             [][]float64
+	p                [][]float64
+	cylinder         *Circle
+	airfoil          *Airfoil
+	rotatingCylinder *RotatingCylinder
 }
 
 // Circle represents a circular object in the flow
@@ -44,11 +49,24 @@ type Circle struct {
 	radius           float64
 }
 
+// RotatingCylinder represents a cylinder with circulation in the flow
+type RotatingCylinder struct {
+	centerX, centerY float64
+	radius           float64
+	circulation      float64
+}
+
 // Airfoil represents an airfoil shape in the flow
 type Airfoil struct {
-	centerX, centerY      float64
-	chord, thicknessRatio float64
-	camber, camberPos     float64
+	centerX, centerY float64
+	chord            float64
+	angleOfAttack    float64 // in degrees
+	useCustomProfile bool    // whether to use custom profile or NACA equation
+	// Parameters for NACA equation
+	thicknessRatio    float64
+	camber, camberPos float64
+	// For custom airfoil profile
+	profile [][2]float64 // normalized coordinates
 }
 
 // NewFluidFlowSimulation creates a new fluid flow simulation
@@ -155,56 +173,208 @@ func (sim *FluidFlowSimulation) AddCylinder(centerX, centerY, radius float64) {
 	}
 }
 
-// AddAirfoil adds a cambered NACA 4-digit airfoil to the mask
-func (sim *FluidFlowSimulation) AddAirfoil(centerX, centerY, chord, thicknessRatio, camber, camberPos float64) {
+// AddRotatingCylinder adds a rotating cylinder with circulation to the flow field
+func (sim *FluidFlowSimulation) AddRotatingCylinder(centerX, centerY, radius, circulation float64) {
+	// Mask solid points same as regular cylinder
 	for i := 0; i < sim.nx; i++ {
 		for j := 0; j < sim.ny; j++ {
-			xAbs := sim.x[i]
-			yAbs := sim.y[j]
+			if math.Pow(sim.x[i]-centerX, 2)+math.Pow(sim.y[j]-centerY, 2) <= math.Pow(radius, 2) {
+				sim.mask[j][i] = false // Mark as solid
+			}
+		}
+	}
 
-			xRel := xAbs - centerX
-			yRel := yAbs - centerY
+	// Store for visualization and calculation
+	sim.rotatingCylinder = &RotatingCylinder{
+		centerX:     centerX,
+		centerY:     centerY,
+		radius:      radius,
+		circulation: circulation,
+	}
 
-			if xRel >= 0 && xRel <= chord {
-				xNorm := xRel / chord
+	// Apply analytical solution of rotating cylinder for boundary conditions
+	// This initializes psi with values that include circulation effects
+	// Helps convergence by providing a good initial guess
+	for j := 0; j < sim.ny; j++ {
+		for i := 0; i < sim.nx; i++ {
+			// Calculate r and theta for polar coordinates
+			dx := sim.x[i] - centerX
+			dy := sim.y[j] - centerY
+			r := math.Sqrt(dx*dx + dy*dy)
+			theta := math.Atan2(dy, dx)
 
-				// Camber line z_c and its slope dzc_dx
-				var zC, dzcDx float64
-				if xNorm < camberPos {
-					zC = (camber / math.Pow(camberPos, 2)) * (2*camberPos*xNorm - math.Pow(xNorm, 2))
-					dzcDx = (2 * camber / math.Pow(camberPos, 2)) * (camberPos - xNorm)
-				} else {
-					zC = (camber / math.Pow(1-camberPos, 2)) * ((1 - 2*camberPos) + 2*camberPos*xNorm - math.Pow(xNorm, 2))
-					dzcDx = (2 * camber / math.Pow(1-camberPos, 2)) * (camberPos - xNorm)
+			// Only calculate for points outside the cylinder
+			if r > radius {
+				// Analytical solution from potential flow theory
+				// ψ = U*r*sin(θ)*(1 - (a²/r²)) - (Γ/(2π))*ln(r/a)
+				sim.psi[j][i] = sim.vInf*r*math.Sin(theta)*(1-math.Pow(radius/r, 2)) -
+					(circulation/(2*math.Pi))*math.Log(r/radius)
+			}
+		}
+	}
+}
+
+// AddAirfoil adds a cambered NACA 4-digit airfoil to the mask
+func (sim *FluidFlowSimulation) AddAirfoil(centerX, centerY, chord, angleOfAttack float64, useCustomProfile bool, thicknessRatio, camber, camberPos float64) {
+	// Convert angle from degrees to radians (note: reversing sign for correct convention)
+	// Positive AOA means nose up, which should rotate counterclockwise in our coordinate system
+	angleRad := -angleOfAttack * math.Pi / 180.0 // Negative sign added to reverse direction
+	cosAngle := math.Cos(angleRad)
+	sinAngle := math.Sin(angleRad)
+
+	// Initialize custom profile if needed
+	var profile [][2]float64
+	if useCustomProfile {
+		// NACA 24012 airfoil profile
+		profile = [][2]float64{
+			{1.000034, 0.001260}, {0.998499, 0.001517}, {0.993901, 0.002286}, {0.986271, 0.003554},
+			{0.975654, 0.005302}, {0.962115, 0.007503}, {0.945737, 0.010126}, {0.926621, 0.013135},
+			{0.904884, 0.016488}, {0.880660, 0.020143}, {0.854096, 0.024054}, {0.825357, 0.028176},
+			{0.794619, 0.032461}, {0.762070, 0.036859}, {0.727912, 0.041322}, {0.692353, 0.045797},
+			{0.655613, 0.050232}, {0.617917, 0.054570}, {0.579496, 0.058755}, {0.540587, 0.062726},
+			{0.501429, 0.066422}, {0.462262, 0.069781}, {0.423325, 0.072741}, {0.384859, 0.075241},
+			{0.347100, 0.077226}, {0.310278, 0.078646}, {0.274563, 0.079453}, {0.239831, 0.079489},
+			{0.206317, 0.078497}, {0.174345, 0.076299}, {0.144248, 0.072811}, {0.116354, 0.068044},
+			{0.090970, 0.062103}, {0.068368, 0.055171}, {0.048771, 0.047489}, {0.032351, 0.039329},
+			{0.019219, 0.030969}, {0.009432, 0.022669}, {0.002997, 0.014646}, {-0.000123, 0.007059},
+			{0.000000, 0.000000}, {0.003205, -0.006286}, {0.009315, -0.011612}, {0.018198, -0.016059},
+			{0.029725, -0.019740}, {0.043770, -0.022790}, {0.060222, -0.025349}, {0.078992, -0.027560},
+			{0.100013, -0.029550}, {0.123240, -0.031426}, {0.148645, -0.033265}, {0.176207, -0.035103},
+			{0.205898, -0.036930}, {0.237671, -0.038675}, {0.271447, -0.040202}, {0.307039, -0.041310},
+			{0.343883, -0.041880}, {0.381695, -0.041935}, {0.420240, -0.041514}, {0.459279, -0.040660},
+			{0.498571, -0.039420}, {0.537872, -0.037842}, {0.576938, -0.035976}, {0.615529, -0.033871},
+			{0.653404, -0.031573}, {0.690330, -0.029128}, {0.726079, -0.026578}, {0.760428, -0.023965},
+			{0.793166, -0.021330}, {0.824091, -0.018710}, {0.853011, -0.016145}, {0.879746, -0.013673},
+			{0.904133, -0.011331}, {0.926019, -0.009155}, {0.945270, -0.007183}, {0.961765, -0.005448},
+			{0.975403, -0.003980}, {0.986099, -0.002808}, {0.993787, -0.001953}, {0.998419, -0.001434},
+			{0.999966, -0.001260},
+		}
+	}
+
+	// For custom profile, find the bounding box
+	minX, maxX, minY, maxY := 0.0, 0.0, 0.0, 0.0
+	if useCustomProfile {
+		minX, maxX = profile[0][0], profile[0][0]
+		minY, maxY = profile[0][1], profile[0][1]
+
+		for _, point := range profile {
+			if point[0] < minX {
+				minX = point[0]
+			}
+			if point[0] > maxX {
+				maxX = point[0]
+			}
+			if point[1] < minY {
+				minY = point[1]
+			}
+			if point[1] > maxY {
+				maxY = point[1]
+			}
+		}
+	}
+
+	// Loop through grid points
+	for i := 0; i < sim.nx; i++ {
+		for j := 0; j < sim.ny; j++ {
+			// Convert to airfoil-centered coordinates
+			xRel := sim.x[i] - centerX
+			yRel := sim.y[j] - centerY
+
+			// Rotate coordinates based on angle of attack
+			xRot := xRel*cosAngle + yRel*sinAngle
+			yRot := -xRel*sinAngle + yRel*cosAngle
+
+			// Check if point is within airfoil shape
+			if useCustomProfile {
+				// For custom airfoil profile
+				if xRot >= 0 && xRot <= chord {
+					// Normalize to profile coordinates
+					xNorm := xRot / chord
+
+					// Find the corresponding y values by linear interpolation
+					var yUpper, yLower float64
+
+					// Find upper and lower profile points at this x position
+					foundUpper, foundLower := false, false
+
+					for k := 0; k < len(profile)-1; k++ {
+						// Check if this segment contains our x value
+						x1, y1 := profile[k][0], profile[k][1]
+						x2, y2 := profile[k+1][0], profile[k+1][1]
+
+						if xNorm >= x1 && xNorm <= x2 || xNorm >= x2 && xNorm <= x1 {
+							// Linear interpolation
+							t := (xNorm - x1) / (x2 - x1)
+							yInterp := y1 + t*(y2-y1)
+
+							// Determine if this is upper or lower surface
+							if yInterp >= 0 && !foundUpper {
+								yUpper = yInterp * chord
+								foundUpper = true
+							} else if yInterp <= 0 && !foundLower {
+								yLower = yInterp * chord
+								foundLower = true
+							}
+
+							// Exit if we found both surfaces
+							if foundUpper && foundLower {
+								break
+							}
+						}
+					}
+
+					// Check if the point is inside the airfoil
+					if foundUpper && foundLower && yRot >= yLower && yRot <= yUpper {
+						sim.mask[j][i] = false
+					}
 				}
+			} else {
+				// For NACA 4-digit airfoil using the equation method
+				if xRot >= 0 && xRot <= chord {
+					xNorm := xRot / chord
 
-				theta := math.Atan(dzcDx)
+					// Camber line z_c and its slope dzc_dx
+					var zC, dzcDx float64
+					if xNorm < camberPos {
+						zC = (camber / math.Pow(camberPos, 2)) * (2*camberPos*xNorm - math.Pow(xNorm, 2))
+						dzcDx = (2 * camber / math.Pow(camberPos, 2)) * (camberPos - xNorm)
+					} else {
+						zC = (camber / math.Pow(1-camberPos, 2)) * ((1 - 2*camberPos) + 2*camberPos*xNorm - math.Pow(xNorm, 2))
+						dzcDx = (2 * camber / math.Pow(1-camberPos, 2)) * (camberPos - xNorm)
+					}
 
-				// Thickness distribution
-				yt := 5 * thicknessRatio * chord * (0.2969*math.Sqrt(xNorm) -
-					0.1260*xNorm -
-					0.3516*math.Pow(xNorm, 2) +
-					0.2843*math.Pow(xNorm, 3) -
-					0.1015*math.Pow(xNorm, 4))
+					theta := math.Atan(dzcDx)
 
-				// Upper and lower surface positions
-				yUpper := zC + yt*math.Cos(theta)
-				yLower := zC - yt*math.Cos(theta)
+					// Thickness distribution
+					yt := 5 * thicknessRatio * chord * (0.2969*math.Sqrt(xNorm) -
+						0.1260*xNorm -
+						0.3516*math.Pow(xNorm, 2) +
+						0.2843*math.Pow(xNorm, 3) -
+						0.1015*math.Pow(xNorm, 4))
 
-				if yRel >= yLower && yRel <= yUpper {
-					sim.mask[j][i] = false
+					// Upper and lower surface positions
+					yUpper := zC + yt*math.Cos(theta)
+					yLower := zC - yt*math.Cos(theta)
+
+					if yRot >= yLower && yRot <= yUpper {
+						sim.mask[j][i] = false
+					}
 				}
 			}
 		}
 	}
 
+	// Store for reference
 	sim.airfoil = &Airfoil{
-		centerX:        centerX,
-		centerY:        centerY,
-		chord:          chord,
-		thicknessRatio: thicknessRatio,
-		camber:         camber,
-		camberPos:      camberPos,
+		centerX:          centerX,
+		centerY:          centerY,
+		chord:            chord,
+		angleOfAttack:    angleOfAttack,
+		useCustomProfile: useCustomProfile,
+		thicknessRatio:   thicknessRatio,
+		camber:           camber,
+		camberPos:        camberPos,
+		profile:          profile,
 	}
 }
 
@@ -218,6 +388,9 @@ func (sim *FluidFlowSimulation) SolveStreamFunction() {
 
 	// Use multiple goroutines for parallelization
 	numCPU := runtime.NumCPU()
+
+	// Relaxation parameter for SOR method (optimized for faster convergence)
+	omega := 1.8
 
 	for iterCount := 0; iterCount < sim.maxIter; iterCount++ {
 		// Use parallel processing for the interior points
@@ -240,12 +413,13 @@ func (sim *FluidFlowSimulation) SolveStreamFunction() {
 
 			go func(startRow, endRow int) {
 				defer wg.Done()
-				// Gauss-Seidel iteration for interior points
+				// Gauss-Seidel iteration with SOR for interior points
 				for j := startRow; j < endRow; j++ {
 					for i := 1; i < sim.nx-1; i++ {
 						if sim.mask[j][i] {
-							sim.psi[j][i] = 0.25 * (sim.psi[j][i+1] + sim.psi[j][i-1] +
+							psiNew := 0.25 * (sim.psi[j][i+1] + sim.psi[j][i-1] +
 								sim.psi[j+1][i] + sim.psi[j-1][i])
+							sim.psi[j][i] = (1-omega)*sim.psi[j][i] + omega*psiNew
 						}
 					}
 				}
@@ -273,6 +447,11 @@ func (sim *FluidFlowSimulation) SolveStreamFunction() {
 		if maxDiff < sim.tol {
 			fmt.Printf("Stream function converged after %d iterations\n", iterCount)
 			break
+		}
+
+		// Print progress for long computations
+		if iterCount%1000 == 0 {
+			fmt.Printf("Iteration: %d, Max difference: %e\n", iterCount, maxDiff)
 		}
 	}
 
@@ -350,6 +529,13 @@ func (sim *FluidFlowSimulation) calculateVelocityField() {
 
 // SaveResults saves plots of simulation results
 func (sim *FluidFlowSimulation) SaveResults() {
+	// Create data directory if it doesn't exist
+	dataDir := "data"
+	err := os.MkdirAll(dataDir, 0755)
+	if err != nil {
+		panic(err)
+	}
+
 	// Stream function plot
 	sim.savePlot("stream_function", sim.psi, "Stream Function")
 
@@ -368,13 +554,38 @@ func (sim *FluidFlowSimulation) SaveResults() {
 
 	// Create velocity field quiver plot
 	sim.saveVelocityPlot("velocity_field")
+	// Save mask data
+	sim.saveMaskData("mask")
+}
+
+// saveMaskData saves the fluid/solid mask (1 = fluid, 0 = solid)
+func (sim *FluidFlowSimulation) saveMaskData(filename string) {
+	dataDir := "data"
+	filepath := filepath.Join(dataDir, filename+".data")
+
+	f, err := os.Create(filepath)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	for j := 0; j < sim.ny; j++ {
+		for i := 0; i < sim.nx; i++ {
+			maskVal := 0.0
+			if sim.mask[j][i] {
+				maskVal = 1.0
+			}
+			fmt.Fprintf(f, "%f %f %f\n", sim.x[i], sim.y[j], maskVal)
+		}
+		fmt.Fprintln(f)
+	}
+
+	fmt.Printf("Mask data saved to %s.data\n", filename)
 }
 
 // savePlot saves a contour plot for a given field
 func (sim *FluidFlowSimulation) savePlot(filename string, field [][]float64, title string) {
-
 	// Save data to a text file instead (simple alternative to heatmap)
-
 	dataDir := "data"
 	filepath := filepath.Join(dataDir, filename+".data")
 
@@ -475,20 +686,192 @@ func (c *Circle) Plot(canvas draw.Canvas, plt *plot.Plot) {
 	scatter.Plot(canvas, plt)
 }
 
+// runVisualization executes the Python visualization script
+func runVisualization() {
+	// Check if Python is installed
+	pythonCmd := "python"
+	if _, err := exec.LookPath(pythonCmd); err != nil {
+		// Try python3 if python command not found
+		pythonCmd = "python3"
+		if _, err := exec.LookPath(pythonCmd); err != nil {
+			fmt.Println("Error: Python not found. Please install Python and try again.")
+			return
+		}
+	}
+
+	// Set up the command
+	cmd := exec.Command(pythonCmd, "visualize_data.py")
+
+	// Get the output
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	if err != nil {
+		fmt.Printf("Error running visualization: %s\n", err)
+
+		// Check for specific common errors and provide helpful instructions
+		if strings.Contains(outputStr, "No module named 'numpy'") ||
+			strings.Contains(outputStr, "No module named 'matplotlib'") {
+			fmt.Println("\nIt looks like you're missing some required Python packages.")
+			fmt.Println("Please install the required packages with the following command:")
+			fmt.Println("\npip install numpy matplotlib")
+			fmt.Println("\nOr if you're using Python 3:")
+			fmt.Println("pip3 install numpy matplotlib")
+			fmt.Println("\nAfter installing the packages, run the visualization manually with:")
+			fmt.Println("python visualize_data.py")
+		} else {
+			fmt.Println("Error output:", outputStr)
+		}
+		return
+	}
+
+	fmt.Println("Visualization completed successfully!")
+	fmt.Println(outputStr)
+}
+
+// displayMenu shows the simulation options and gets user selection
+func displayMenu() (int, bool, string, int) {
+	fmt.Println("\n=== Fluid Flow Simulation Options ===")
+	fmt.Println("1. Regular Cylinder")
+	fmt.Println("2. Rotating Cylinder (with circulation)")
+	fmt.Println("3. NACA Airfoil")
+	fmt.Println("4. NACA 24012 Airfoil (custom profile)")
+	fmt.Println("5. Exit")
+	fmt.Println("\nAdditional parameters:")
+	fmt.Println("- Add 'auto' to automatically run visualization after simulation")
+	fmt.Println("- For airfoil options (3-4), you can specify angle of attack in degrees")
+	fmt.Println("- Add 'res=N' to set grid resolution (e.g., 'res=100' for 100x100 grid)")
+	fmt.Println("  Default resolution is 150. Higher values give better accuracy but take longer.")
+	fmt.Println("\nExamples:")
+	fmt.Println("  '3 5' - NACA airfoil at 5 degrees angle of attack")
+	fmt.Println("  '4 auto 10 res=200' - NACA 24012 at 10 degrees with 200x200 grid and auto visualization")
+	fmt.Print("\nEnter your choice: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	// Parse the input
+	parts := strings.Fields(input)
+	if len(parts) == 0 {
+		fmt.Println("Invalid selection. Please try again.")
+		return displayMenu() // recursively call until valid input
+	}
+
+	// Check if auto option is included
+	autoVisualize := false
+	params := ""
+	resolution := 150 // Default resolution
+
+	// Get the choice first
+	choiceStr := parts[0]
+	choice, err := strconv.Atoi(choiceStr)
+	if err != nil || choice < 1 || choice > 5 {
+		fmt.Println("Invalid selection. Please enter a number between 1 and 5.")
+		return displayMenu() // recursively call until valid input
+	}
+
+	// Process remaining parts
+	for i := 1; i < len(parts); i++ {
+		part := strings.ToLower(parts[i])
+
+		if part == "auto" {
+			autoVisualize = true
+		} else if strings.HasPrefix(part, "res=") {
+			// Extract resolution value
+			resStr := strings.TrimPrefix(part, "res=")
+			res, err := strconv.Atoi(resStr)
+			if err == nil && res > 0 {
+				resolution = res
+			} else {
+				fmt.Printf("Invalid resolution format: '%s'. Using default (150x150).\n", part)
+			}
+		} else {
+			// Collect additional parameters (like angle of attack)
+			if params != "" {
+				params += " "
+			}
+			params += parts[i]
+		}
+	}
+
+	return choice, autoVisualize, params, resolution
+}
+
 func main() {
 	// Initialize random seed
 	rand.Seed(time.Now().UnixNano())
 
-	// Create simulation
-	sim := NewFluidFlowSimulation(100, 100, 1.0, 30000, 1e-6)
+	// Display menu and get user choice
+	choice, autoVisualize, params, resolution := displayMenu()
 
-	// Uncomment the desired object
-	//sim.AddCylinder(5.0, 0.0, 1.0)
-	sim.AddAirfoil(2.5, 0.0, 7.0, 0.12, 0.02, 0.4)
+	// Exit if user chose option 5
+	if choice == 5 {
+		fmt.Println("Exiting program.")
+		return
+	}
+
+	// Create simulation with appropriate parameters
+	fmt.Printf("Creating simulation with %dx%d grid resolution...\n", resolution, resolution)
+	// Calculate max iterations based on resolution (higher resolution needs more iterations)
+	maxIter := 50000
+	if resolution > 150 {
+		// Scale iterations up for higher resolutions
+		maxIter = int(float64(maxIter) * math.Pow(float64(resolution)/150.0, 1.5))
+	}
+
+	sim := NewFluidFlowSimulation(resolution, resolution, 1.0, maxIter, 1e-6)
+
+	// Parse angle of attack if provided for airfoil options
+	angleOfAttack := 0.0
+	if (choice == 3 || choice == 4) && params != "" {
+		angle, err := strconv.ParseFloat(params, 64)
+		if err == nil {
+			angleOfAttack = angle
+			fmt.Printf("Setting angle of attack to %.1f degrees\n", angleOfAttack)
+		} else {
+			fmt.Printf("Could not parse angle of attack '%s', using default (0 degrees)\n", params)
+		}
+	}
+
+	// Setup based on user selection
+	switch choice {
+	case 1:
+		fmt.Println("Running simulation with regular cylinder...")
+		sim.AddCylinder(5.0, 0.0, 1.0)
+	case 2:
+		fmt.Println("Running simulation with rotating cylinder...")
+		// Parameters: centerX, centerY, radius, circulation
+		sim.AddRotatingCylinder(5.0, 0.0, 1.0, 2*math.Pi)
+	case 3:
+		fmt.Printf("Running simulation with NACA airfoil at %.1f° angle of attack...\n", angleOfAttack)
+		// Parameters: centerX, centerY, chord, angleOfAttack, useCustomProfile, thickness, camber, camberPos
+		// Note: Positive AOA means nose up (leading edge higher than trailing edge)
+		sim.AddAirfoil(2.5, 0.0, 7.0, angleOfAttack, false, 0.12, 0.02, 0.4)
+	case 4:
+		fmt.Printf("Running simulation with NACA 24012 airfoil at %.1f° angle of attack...\n", angleOfAttack)
+		// Parameters: centerX, centerY, chord, angleOfAttack, useCustomProfile, thickness, camber, camberPos
+		// Note: Positive AOA means nose up (leading edge higher than trailing edge)
+		// For custom profile, thickness/camber/camberPos are not used but included for compatibility
+		sim.AddAirfoil(2.5, 0.0, 7.0, angleOfAttack, true, 0.12, 0.02, 0.4)
+	}
 
 	// Solve and visualize
+	fmt.Printf("Solving stream function with up to %d iterations. This may take a few minutes...\n", maxIter)
 	sim.SolveStreamFunction()
+	fmt.Println("Saving results...")
 	sim.SaveResults()
 
-	fmt.Println("Simulation completed. Results saved to image files and flow_animation.gif")
+	fmt.Println("\nSimulation completed. Results saved to data directory.")
+
+	// Automatically run visualization if requested
+	if autoVisualize {
+		fmt.Println("Automatically running visualization...")
+		runVisualization()
+	} else {
+		fmt.Println("Run the Python visualizer with: python visualize_data.py")
+		fmt.Println("\nNote: The visualization requires numpy, scipy, tqdm and matplotlib.")
+		fmt.Println("If you haven't installed them, run:")
+		fmt.Println("pip install numpy matplotlib scipy tqdm")
+	}
 }
