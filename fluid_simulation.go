@@ -968,3 +968,6 @@ func main() {
 		fmt.Println("pip install numpy matplotlib scipy tqdm")
 	}
 }
+
+
+si quiero cambiar algo toqueteeo y ytal.
