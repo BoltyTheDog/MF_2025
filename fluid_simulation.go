@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -527,6 +528,92 @@ func (sim *FluidFlowSimulation) calculateVelocityField() {
 	}
 }
 
+// CalculateLiftCoefficient calculates the lift coefficient by integrating
+// the pressure distribution around the airfoil surface
+func (sim *FluidFlowSimulation) CalculateLiftCoefficient() float64 {
+	// Only proceed if we have an airfoil
+	if sim.airfoil == nil {
+		fmt.Println("No airfoil present in simulation")
+		return 0.0
+	}
+
+	// Reference values
+	rho := 1.0                              // Density (assumed constant)
+	qInf := 0.5 * rho * sim.vInf * sim.vInf // Dynamic pressure
+	chordLength := sim.airfoil.chord
+
+	// Get angle of attack in radians
+	angleRad := sim.airfoil.angleOfAttack * math.Pi / 180.0 // FIXED: Removed negative sign
+
+	// Initialize lift and drag forces
+	liftForce := 0.0
+
+	// Find surface points around airfoil (points adjacent to solid cells)
+	surfacePoints := [][3]float64{} // [x, y, pressure]
+
+	// Loop through grid points to find surface points
+	for j := 1; j < sim.ny-1; j++ {
+		for i := 1; i < sim.nx-1; i++ {
+			// Check if this is a fluid point adjacent to a solid point
+			if sim.mask[j][i] && (!sim.mask[j+1][i] || !sim.mask[j-1][i] ||
+				!sim.mask[j][i+1] || !sim.mask[j][i-1]) {
+				// This is a fluid point adjacent to the airfoil surface
+				// Get pressure at this point
+				pressure := sim.p[j][i]
+
+				// Store coordinates and pressure
+				surfacePoints = append(surfacePoints, [3]float64{sim.x[i], sim.y[j], pressure})
+			}
+		}
+	}
+
+	// Sort surface points clockwise around the airfoil center
+	centerX, centerY := sim.airfoil.centerX, sim.airfoil.centerY
+	sort.Slice(surfacePoints, func(i, j int) bool {
+		// Calculate angles from center to each point
+		angleI := math.Atan2(surfacePoints[i][1]-centerY, surfacePoints[i][0]-centerX)
+		angleJ := math.Atan2(surfacePoints[j][1]-centerY, surfacePoints[j][0]-centerX)
+		return angleI < angleJ
+	})
+
+	// Integrate pressure around the airfoil surface
+	for i := 0; i < len(surfacePoints); i++ {
+		p1 := surfacePoints[i]
+		p2 := surfacePoints[(i+1)%len(surfacePoints)]
+
+		// Calculate pressure force on this segment
+		avgPressure := (p1[2] + p2[2]) / 2.0
+
+		// Calculate normal vector to the segment
+		dx := p2[0] - p1[0]
+		dy := p2[1] - p1[1]
+		length := math.Sqrt(dx*dx + dy*dy)
+
+		if length > 0 {
+			// Normal vector (perpendicular to segment, pointing outward)
+			nx := dy / length
+			ny := -dx / length
+
+			// Force is pressure times area (length in 2D)
+			force := avgPressure * length
+
+			// FIXED: Correct lift force calculation
+			// Lift is perpendicular to freestream direction
+			// For positive angle of attack, lift should be positive (upward)
+			// The minus sign before ny is because in our coordinate system, upward is negative y
+			liftForce += force * (nx*math.Sin(angleRad) - ny*math.Cos(angleRad))
+		}
+	}
+
+	// Calculate lift coefficient
+	Cl := liftForce / (qInf * chordLength)
+
+	fmt.Printf("Calculated lift coefficient (Cl): %.4f at %.1f° angle of attack\n",
+		Cl, sim.airfoil.angleOfAttack)
+
+	return Cl
+}
+
 // SaveResults saves plots of simulation results
 func (sim *FluidFlowSimulation) SaveResults() {
 	// Create data directory if it doesn't exist
@@ -861,6 +948,12 @@ func main() {
 	sim.SolveStreamFunction()
 	fmt.Println("Saving results...")
 	sim.SaveResults()
+
+	// Calculate lift coefficient if this is an airfoil simulation
+	if choice == 3 || choice == 4 {
+		cl := sim.CalculateLiftCoefficient()
+		fmt.Printf("Lift coefficient (Cl): %.4f\n", cl)
+	}
 
 	fmt.Println("\nSimulation completed. Results saved to data directory.")
 
