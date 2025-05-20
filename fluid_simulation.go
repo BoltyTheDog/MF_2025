@@ -528,13 +528,13 @@ func (sim *FluidFlowSimulation) calculateVelocityField() {
 	}
 }
 
-// CalculateLiftCoefficient calculates the lift coefficient by integrating
+// CalculateAerodynamicCoefficients calculates both lift and drag coefficients by integrating
 // the pressure distribution around the airfoil surface
-func (sim *FluidFlowSimulation) CalculateLiftCoefficient() float64 {
+func (sim *FluidFlowSimulation) CalculateAerodynamicCoefficients() (float64, float64) {
 	// Only proceed if we have an airfoil
 	if sim.airfoil == nil {
 		fmt.Println("No airfoil present in simulation")
-		return 0.0
+		return 0.0, 0.0
 	}
 
 	// Reference values
@@ -543,10 +543,11 @@ func (sim *FluidFlowSimulation) CalculateLiftCoefficient() float64 {
 	chordLength := sim.airfoil.chord
 
 	// Get angle of attack in radians
-	angleRad := sim.airfoil.angleOfAttack * math.Pi / 180.0 // FIXED: Removed negative sign
+	angleRad := sim.airfoil.angleOfAttack * math.Pi / 180.0
 
 	// Initialize lift and drag forces
 	liftForce := 0.0
+	dragForce := 0.0
 
 	// Find surface points around airfoil (points adjacent to solid cells)
 	surfacePoints := [][3]float64{} // [x, y, pressure]
@@ -597,21 +598,25 @@ func (sim *FluidFlowSimulation) CalculateLiftCoefficient() float64 {
 			// Force is pressure times area (length in 2D)
 			force := avgPressure * length
 
-			// FIXED: Correct lift force calculation
-			// Lift is perpendicular to freestream direction
-			// For positive angle of attack, lift should be positive (upward)
-			// The minus sign before ny is because in our coordinate system, upward is negative y
-			liftForce += force * (nx*math.Sin(angleRad) - ny*math.Cos(angleRad))
+			// CORRECTED FORMULA: For a cambered airfoil, we need to flip the sign
+			// to get positive lift at 0 AOA
+			// The negative sign is due to how normal vectors are calculated relative
+			// to the coordinate system
+			liftForce -= force * (nx*math.Sin(angleRad) - ny*math.Cos(angleRad))
+			dragForce -= force * (nx*math.Cos(angleRad) + ny*math.Sin(angleRad))
 		}
 	}
 
 	// Calculate lift coefficient
 	Cl := liftForce / (qInf * chordLength)
+	Cd := dragForce / (qInf * chordLength)
 
 	fmt.Printf("Calculated lift coefficient (Cl): %.4f at %.1f° angle of attack\n",
 		Cl, sim.airfoil.angleOfAttack)
+	fmt.Printf("Calculated drag coefficient (Cd): %.4f\n", Cd)
+	fmt.Printf("Lift-to-drag ratio (L/D): %.2f\n", Cl/Cd)
 
-	return Cl
+	return Cl, Cd
 }
 
 // SaveResults saves plots of simulation results
@@ -705,7 +710,7 @@ func (sim *FluidFlowSimulation) saveVelocityPlot(filename string) {
 	defer f.Close()
 
 	// Write velocity vector data
-	skip := 5 // Skip some points for better visualization
+	skip := 10 // Skip some points for better visualization
 	for j := 0; j < sim.ny; j += skip {
 		for i := 0; i < sim.nx; i += skip {
 			if sim.mask[j][i] {
@@ -727,37 +732,6 @@ func linspace(start, end float64, num int) []float64 {
 		result[i] = start + float64(i)*step
 	}
 	return result
-}
-
-func scale(x, inMin, inMax, outMin, outMax float64) float64 {
-	return (x-inMin)*(outMax-outMin)/(inMax-inMin) + outMin
-}
-
-func findIndex(array []float64, value float64) int {
-	for i := 0; i < len(array)-1; i++ {
-		if value >= array[i] && value < array[i+1] {
-			return i
-		}
-	}
-	return len(array) - 1
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func randomBetween(min, max float64) float64 {
-	return min + (max-min)*rand.Float64()
 }
 
 // Plot implements the plot.Plotter interface for drawing a circle
@@ -951,8 +925,9 @@ func main() {
 
 	// Calculate lift coefficient if this is an airfoil simulation
 	if choice == 3 || choice == 4 {
-		cl := sim.CalculateLiftCoefficient()
+		cl, cd := sim.CalculateAerodynamicCoefficients()
 		fmt.Printf("Lift coefficient (Cl): %.4f\n", cl)
+		fmt.Printf("Drag coefficient (Cd): %.4f\n", cd)
 	}
 
 	fmt.Println("\nSimulation completed. Results saved to data directory.")
